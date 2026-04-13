@@ -1,5 +1,5 @@
 import os
-from datetime import date, datetime
+from datetime import date
 
 import pandas as pd
 import streamlit as st
@@ -13,14 +13,11 @@ st.set_page_config(page_title=APP_TITLE, page_icon="💸", layout="wide")
 
 
 def initialize_storage() -> None:
-    """Create the CSV file with headers if it does not exist."""
     if not os.path.exists(DATA_FILE):
-        df = pd.DataFrame(columns=COLUMNS)
-        df.to_csv(DATA_FILE, index=False)
+        pd.DataFrame(columns=COLUMNS).to_csv(DATA_FILE, index=False)
 
 
 def load_data() -> pd.DataFrame:
-    """Load expense data from CSV and normalize types."""
     initialize_storage()
     try:
         df = pd.read_csv(DATA_FILE)
@@ -30,40 +27,50 @@ def load_data() -> pd.DataFrame:
     if df.empty:
         return pd.DataFrame(columns=COLUMNS)
 
-    # Ensure expected columns exist even if the file was edited manually.
     for col in COLUMNS:
         if col not in df.columns:
             df[col] = ""
 
     df = df[COLUMNS].copy()
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
     df["amount"] = pd.to_numeric(df["amount"], errors="coerce")
-    df = df.dropna(subset=["date", "amount"])
-    df["amount"] = df["amount"].astype(float)
     df["category"] = df["category"].fillna("Other").astype(str)
     df["description"] = df["description"].fillna("").astype(str)
     df["payment_mode"] = df["payment_mode"].fillna("Cash").astype(str)
+
+    # ── FIX: parse dates safely, drop unparseable rows ──────────────────────
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["date", "amount"])
+
+    if df.empty:
+        return pd.DataFrame(columns=COLUMNS)
+
+    df["amount"] = df["amount"].astype(float)
+    # ── FIX: ensure dtype is datetime64 so .dt accessor always works ────────
+    df["date"] = df["date"].astype("datetime64[ns]")
+
     return df.sort_values("date", ascending=False).reset_index(drop=True)
 
 
 def save_data(df: pd.DataFrame) -> None:
-    """Save expense data to CSV."""
     out = df.copy()
-    out["date"] = out["date"].dt.strftime("%Y-%m-%d")
+    # ── FIX: only call .dt.strftime if column is actually datetime ───────────
+    if pd.api.types.is_datetime64_any_dtype(out["date"]):
+        out["date"] = out["date"].dt.strftime("%Y-%m-%d")
     out.to_csv(DATA_FILE, index=False)
 
 
-def add_expense(expense_date: date, category: str, description: str, amount: float, payment_mode: str) -> None:
+def add_expense(expense_date: date, category: str, description: str,
+                amount: float, payment_mode: str) -> None:
     df = load_data()
-    new_row = pd.DataFrame(
-        [{
-            "date": pd.to_datetime(expense_date),
-            "category": category.strip() or "Other",
-            "description": description.strip(),
-            "amount": float(amount),
-            "payment_mode": payment_mode.strip() or "Cash",
-        }]
-    )
+    new_row = pd.DataFrame([{
+        "date":         pd.Timestamp(expense_date),
+        "category":     category.strip() or "Other",
+        "description":  description.strip(),
+        "amount":       float(amount),
+        "payment_mode": payment_mode.strip() or "Cash",
+    }])
+    # ── FIX: ensure new_row date column has same dtype before concat ─────────
+    new_row["date"] = new_row["date"].astype("datetime64[ns]")
     df = pd.concat([df, new_row], ignore_index=True)
     save_data(df)
     st.success("Expense saved successfully.")
@@ -78,8 +85,7 @@ def delete_row(index: int) -> None:
 
 
 def clear_all() -> None:
-    df = pd.DataFrame(columns=COLUMNS)
-    save_data(df)
+    pd.DataFrame(columns=COLUMNS).to_csv(DATA_FILE, index=False)
     st.warning("All expenses cleared.")
 
 
@@ -89,15 +95,15 @@ def fmt_currency(value: float) -> str:
 
 def render_kpis(df: pd.DataFrame) -> None:
     total_spent = df["amount"].sum() if not df.empty else 0.0
-    avg_spend = df["amount"].mean() if not df.empty else 0.0
-    largest = df["amount"].max() if not df.empty else 0.0
-    txn_count = len(df)
+    avg_spend   = df["amount"].mean() if not df.empty else 0.0
+    largest     = df["amount"].max() if not df.empty else 0.0
+    txn_count   = len(df)
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total spent", fmt_currency(total_spent))
-    c2.metric("Average expense", fmt_currency(avg_spend))
-    c3.metric("Largest expense", fmt_currency(largest))
-    c4.metric("Transactions", f"{txn_count}")
+    c1.metric("Total spent",      fmt_currency(total_spent))
+    c2.metric("Average expense",  fmt_currency(avg_spend))
+    c3.metric("Largest expense",  fmt_currency(largest))
+    c4.metric("Transactions",     str(txn_count))
 
 
 def render_charts(df: pd.DataFrame) -> None:
@@ -107,7 +113,9 @@ def render_charts(df: pd.DataFrame) -> None:
 
     left, right = st.columns(2)
 
-    category_totals = df.groupby("category", as_index=False)["amount"].sum().sort_values("amount", ascending=False)
+    category_totals = (df.groupby("category", as_index=False)["amount"]
+                         .sum()
+                         .sort_values("amount", ascending=False))
     with left:
         st.subheader("Spending by category")
         fig, ax = plt.subplots()
@@ -117,36 +125,39 @@ def render_charts(df: pd.DataFrame) -> None:
         ax.tick_params(axis="x", rotation=35)
         st.pyplot(fig, clear_figure=True)
 
-    daily_totals = df.groupby(df["date"].dt.date, as_index=False)["amount"].sum()
-    daily_totals = daily_totals.sort_values("date")
-    with right:
-        st.subheader("Daily spending")
-        fig, ax = plt.subplots()
-        ax.plot(daily_totals["date"], daily_totals["amount"], marker="o")
-        ax.set_xlabel("Date")
-        ax.set_ylabel("Amount (₹)")
-        ax.tick_params(axis="x", rotation=35)
-        st.pyplot(fig, clear_figure=True)
+    # ── FIX: guard .dt accessor with dtype check ─────────────────────────────
+    if pd.api.types.is_datetime64_any_dtype(df["date"]):
+        daily_totals = (df.groupby(df["date"].dt.date, as_index=False)["amount"]
+                          .sum()
+                          .sort_values("date"))
+        with right:
+            st.subheader("Daily spending")
+            fig, ax = plt.subplots()
+            ax.plot(daily_totals["date"], daily_totals["amount"], marker="o")
+            ax.set_xlabel("Date")
+            ax.set_ylabel("Amount (₹)")
+            ax.tick_params(axis="x", rotation=35)
+            st.pyplot(fig, clear_figure=True)
 
 
 def main() -> None:
     initialize_storage()
 
     st.title("💸 Personal Expense Tracker")
-    st.caption("A small Streamlit project to add, view, filter, and visualize your expenses.")
+    st.caption("Add, view, filter, and visualise your expenses.")
 
     with st.sidebar:
         st.header("Add new expense")
         with st.form("expense_form", clear_on_submit=True):
-            expense_date = st.date_input("Date", value=date.today())
-            category = st.selectbox(
-                "Category",
-                ["Food", "Travel", "Bills", "Shopping", "Education", "Health", "Entertainment", "Other"],
-            )
-            description = st.text_input("Description", placeholder="e.g. Lunch with friends")
-            amount = st.number_input("Amount (₹)", min_value=0.0, step=10.0, format="%.2f")
-            payment_mode = st.selectbox("Payment mode", ["Cash", "UPI", "Card", "Net Banking", "Other"])
-            submitted = st.form_submit_button("Save expense")
+            expense_date  = st.date_input("Date", value=date.today())
+            category      = st.selectbox("Category", [
+                "Food", "Travel", "Bills", "Shopping",
+                "Education", "Health", "Entertainment", "Other"])
+            description   = st.text_input("Description", placeholder="e.g. Lunch with friends")
+            amount        = st.number_input("Amount (₹)", min_value=0.0, step=10.0, format="%.2f")
+            payment_mode  = st.selectbox("Payment mode",
+                                         ["Cash", "UPI", "Card", "Net Banking", "Other"])
+            submitted     = st.form_submit_button("Save expense")
 
             if submitted:
                 if amount <= 0:
@@ -159,27 +170,25 @@ def main() -> None:
             clear_all()
 
     df = load_data()
-
     render_kpis(df)
 
     st.subheader("Filters")
     f1, f2, f3 = st.columns(3)
-    start_date = f1.date_input(
-        "Start date",
-        value=df["date"].min().date() if not df.empty else date.today(),
-    )
-    end_date = f2.date_input(
-        "End date",
-        value=df["date"].max().date() if not df.empty else date.today(),
-    )
-    categories = ["All"] + sorted(df["category"].dropna().unique().tolist()) if not df.empty else ["All"]
+
+    # ── FIX: safe defaults for date filter even when df is empty ─────────────
+    min_date = df["date"].min().date() if not df.empty and pd.api.types.is_datetime64_any_dtype(df["date"]) else date.today()
+    max_date = df["date"].max().date() if not df.empty and pd.api.types.is_datetime64_any_dtype(df["date"]) else date.today()
+
+    start_date        = f1.date_input("Start date", value=min_date)
+    end_date          = f2.date_input("End date",   value=max_date)
+    categories        = ["All"] + sorted(df["category"].dropna().unique().tolist()) if not df.empty else ["All"]
     selected_category = f3.selectbox("Category", categories)
 
     filtered = df.copy()
-    if not df.empty:
+    if not df.empty and pd.api.types.is_datetime64_any_dtype(filtered["date"]):
         filtered = filtered[
-            (filtered["date"].dt.date >= start_date)
-            & (filtered["date"].dt.date <= end_date)
+            (filtered["date"].dt.date >= start_date) &
+            (filtered["date"].dt.date <= end_date)
         ]
         if selected_category != "All":
             filtered = filtered[filtered["category"] == selected_category]
@@ -191,17 +200,19 @@ def main() -> None:
         st.info("No records match the selected filters.")
     else:
         display_df = filtered.copy()
-        display_df["date"] = display_df["date"].dt.strftime("%Y-%m-%d")
+        if pd.api.types.is_datetime64_any_dtype(display_df["date"]):
+            display_df["date"] = display_df["date"].dt.strftime("%Y-%m-%d")
         display_df["amount"] = display_df["amount"].map(lambda x: f"₹{x:,.2f}")
         st.dataframe(display_df, use_container_width=True, hide_index=True)
 
-        csv_bytes = filtered.assign(date=filtered["date"].dt.strftime("%Y-%m-%d")).to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "Download filtered data as CSV",
-            data=csv_bytes,
-            file_name="filtered_expenses.csv",
-            mime="text/csv",
-        )
+        csv_bytes = (filtered
+                     .assign(date=filtered["date"].dt.strftime("%Y-%m-%d"))
+                     .to_csv(index=False)
+                     .encode("utf-8"))
+        st.download_button("Download filtered data as CSV",
+                           data=csv_bytes,
+                           file_name="filtered_expenses.csv",
+                           mime="text/csv")
 
         st.subheader("Delete a transaction")
         options = {
@@ -210,12 +221,12 @@ def main() -> None:
         }
         choice = st.selectbox("Select transaction", list(options.keys()))
         if st.button("Delete selected transaction"):
-            # Map back to the original dataframe index
             selected_row = filtered.reset_index()
-            to_delete = int(selected_row.loc[selected_row.apply(
-                lambda r: f'{r["date"].strftime("%Y-%m-%d")} | {r["category"]} | {str(r["description"])[:30]} | ₹{r["amount"]:,.2f}',
-                axis=1
-            ) == choice, "index"].iloc[0])
+            to_delete = int(selected_row.loc[
+                selected_row.apply(
+                    lambda r: f'{r["date"].strftime("%Y-%m-%d")} | {r["category"]} | {str(r["description"])[:30]} | ₹{r["amount"]:,.2f}',
+                    axis=1) == choice,
+                "index"].iloc[0])
             delete_row(to_delete)
 
 
